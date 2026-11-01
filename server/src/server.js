@@ -12,8 +12,8 @@ import { requireAuth } from "./middleware/auth.js";
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: process.env.CLIENT_URL || "http://localhost:5173" } });
 const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
+const io = new Server(server, { cors: { origin: clientUrl, credentials: true } });
 const refreshCookie = "mkchat_refresh";
 const refreshDays = 7;
 const refreshMaxAge = refreshDays * 24 * 60 * 60 * 1000;
@@ -163,9 +163,29 @@ app.post("/api/auth/logout", async (req, res, next) => {
 
 app.get("/api/auth/me", requireAuth, (req, res) => res.json({ user: publicUser(req.user) }));
 
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token || !process.env.JWT_SECRET) return next(new Error("Authentication required."));
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.type !== "access") return next(new Error("Invalid access token."));
+    socket.data.userId = payload.sub;
+    next();
+  } catch {
+    next(new Error("Invalid or expired access token."));
+  }
+});
+
 io.on("connection", (socket) => {
-  socket.on("join-user", (userId) => socket.join(`user:${userId}`));
-  socket.on("send-message", (message) => io.to(`user:${message.recipientId}`).emit("message-received", message));
+  socket.join(`user:${socket.data.userId}`);
+  socket.on("send-message", (message) => {
+    if (!message?.recipientId || typeof message.text !== "string" || !message.text.trim()) return;
+    io.to(`user:${message.recipientId}`).emit("message-received", {
+      ...message,
+      senderId: socket.data.userId,
+      text: message.text.trim(),
+    });
+  });
   socket.on("typing", ({ recipientId, ...payload }) => io.to(`user:${recipientId}`).emit("typing", payload));
 });
 
@@ -180,7 +200,7 @@ app.use((error, _req, res, _next) => {
 async function start() {
   if (process.env.MONGODB_URI) await mongoose.connect(process.env.MONGODB_URI);
   else console.warn("MONGODB_URI is not configured; authentication routes will return 503.");
-  server.listen(port, () => console.log(`MKChat API listening on http://localhost:${port}`));
+  server.listen(port, "0.0.0.0", () => console.log(`MKChat API listening on port ${port}`));
 }
 
 start().catch((error) => {
